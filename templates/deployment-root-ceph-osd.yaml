@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rook-ceph-osd-{{ osd_number }}
+  namespace: openshift-storage
+spec:
+  template:
+    metadata:
+      name: rook-ceph-osd
+    spec:
+      tolerations:
+        {{ (odf_tolerances + our_tolerances) | to_nice_yaml(indent=2) | string | indent(8) }}

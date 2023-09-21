@@ -1,0 +1,153 @@
+---
+- name: Config ODF
+  hosts: localhost
+  gather_facts: false
+  vars:
+    odf_tolerances: &odf_tolerances
+      - key: node.ocs.openshift.io/storage
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+
+    our_tolerances: &our_tolerances
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: realtime
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: nfv-qe
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: dpdk
+      - effect: NoSchedule
+        key: node.kubernetes.io/unschedulable
+        operator: Exists
+      - effect: NoSchedule
+        key: medik8s.io/drain
+        operator: Exists
+
+
+  tasks:
+
+    - name: Get ODF Subscription
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: Subscription
+        namespace: openshift-storage
+      register: subs
+
+    - name: DEBUG
+      ansible.builtin.debug:
+        msg: "{{ subs | community.general.json_query('resources[*].metadata.name') }}"
+
+    - name: Set tolerance to all subscription
+      loop: "{{ subs | community.general.json_query('resources[*].metadata.name') }}"
+      kubernetes.core.k8s:
+        api_version: operators.coreos.com/v1alpha1
+        kind: Subscription
+        namespace: openshift-storage
+        name: "{{ item }}"
+        state: patched
+        resource_definition:
+          spec:
+            config:
+              tolerations: *our_tolerances
+
+    # Edit the configmap for rook-ceph-operator
+    # oc edit configmap rook-ceph-operator-config -n openshift-storage
+    - name: Add toleration to the CSI pods
+      tags: [odf.pods]
+      kubernetes.core.k8s:
+        kind: ConfigMap
+        namespace: openshift-storage
+        name: rook-ceph-operator-config
+        state: patched
+        resource_definition:
+          data:
+            CSI_PLUGIN_TOLERATIONS: |2-
+              {{ (odf_tolerances + our_tolerances) | to_yaml | string }}
+            CSI_PROVISIONER_TOLERATIONS: |2-
+              {{ (odf_tolerances + our_tolerances) | to_yaml | string }}
+
+    - name: Add the toleration to the toolbox pod
+      tags: [odf.toolbox]
+      kubernetes.core.k8s:
+        api_version: ocs.openshift.io/v1
+        kind: OCSInitialization
+        namespace: openshift-storage
+        name: ocsinit
+        state: patched
+        resource_definition:
+          spec:
+            tolerations: *our_tolerances
+
+    # oc edit storagecluster ocs-storagecluster -n openshift-storage
+    - name: Add toleration to the Rook Ceph and Noobaa pods
+      tags: [odf.storage.cluster]
+      kubernetes.core.k8s:
+        api_version: ocs.openshift.io/v1
+        kind: StorageCluster
+        namespace: openshift-storage
+        name: ocs-storagecluster
+        state: patched
+        resource_definition:
+          spec:
+            placement:
+              tolerations:
+                tolerations: *our_tolerances
+            storageDeviceSets[0]:
+              placement:
+                tolerations: *our_tolerances
+            storageDeviceSets[1]:
+              placement:
+                tolerations: *our_tolerances
+
+    ### This only adds the tolerance in the top object, and not for each storageDeviceSets
+    # - name: Add toleration to the StorageCluster
+    #   tags: [odf.storage.cluster]
+    #   kubernetes.core.k8s:
+    #     api_version: ocs.openshift.io/v1
+    #     kind: StorageCluster
+    #     namespace: openshift-storage
+    #     name: ocs-storagecluster
+    #     state: patched
+    #     resource_definition:
+    #       spec:
+    #         placement:
+    #           tolerations:
+    #             tolerations: *our_tolerances
+
+    # Edit the initialization file
+    # oc edit ocsinitializations.ocs.openshift.io -n openshift-storage
+    - name: Add the toleration to the toolbox pod(if needed)
+      tags: [odf.storage.init]
+      kubernetes.core.k8s:
+        resource_definition:
+          apiVersion: ocs.openshift.io/v1
+          kind: OCSInitialization
+          metadata:
+            name: ocsinit
+            namespace: openshift-storage
+          spec:
+            tolerations: *our_tolerances
+
+    # oc get deployment -l app.kubernetes.io/name=ceph-osd -o jsonpath='{.items[*].metadata.labels.ceph-osd-id}'
+    - name: Get osd deployments
+      tags: [odf.deployment]
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: openshift-storage
+        label_selectors:
+          - app.kubernetes.io/name=ceph-osd
+      register: osd
+
+    - name: Add toleration to the deployment
+      tags: [odf.deployment]
+      kubernetes.core.k8s:
+        template: templates/deployment-root-ceph-osd.yaml
+      loop: "{{ osd | community.general.json_query('resources[*].metadata.labels.\"ceph-osd-id\"') }}"
+      loop_control:
+        loop_var: osd_number
